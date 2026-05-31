@@ -29,13 +29,19 @@ class VisionToTextAdapter(nn.Module):
         self.text_hidden_size = text_hidden_size
         self.num_image_tokens = num_image_tokens
 
-        # TODO: replace with a small projection network.
-        # Recommended: LayerNorm -> Linear -> GELU -> Linear.
-        raise NotImplementedError("Implement VisionToTextAdapter.__init__")
+        self.norm = nn.LayerNorm(vision_hidden_size)
+        self.proj = nn.Sequential(
+            nn.Linear(vision_hidden_size, text_hidden_size),
+            nn.GELU(),
+            nn.Linear(text_hidden_size, text_hidden_size),
+        )
+        self.pool = nn.AdaptiveAvgPool1d(num_image_tokens)
 
     def forward(self, vision_hidden_states: torch.Tensor) -> torch.Tensor:
         """Return visual embeddings [B, num_image_tokens, text_hidden_size]."""
-        raise NotImplementedError("Implement VisionToTextAdapter.forward")
+        x = self.norm(vision_hidden_states)
+        x = self.pool(x.transpose(1, 2)).transpose(1, 2)
+        return self.proj(x)
 
 
 def merge_visual_embeddings(
@@ -58,7 +64,12 @@ def merge_visual_embeddings(
     Assumption for public tests:
         each row has exactly K positions where input_ids == image_token_id.
     """
-    raise NotImplementedError("Implement visual/text embedding merge")
+    merged = input_embeds.clone()
+    mask = input_ids == image_token_id
+    for b in range(input_embeds.shape[0]):
+        positions = mask[b].nonzero(as_tuple=True)[0]
+        merged[b, positions] = visual_embeds[b, : positions.shape[0]].to(merged.dtype)
+    return merged
 
 
 class MathVLM(nn.Module):
@@ -67,7 +78,9 @@ class MathVLM(nn.Module):
     In Track A/B, vision encoder and LLM should be frozen; adapter trainable.
     """
 
-    def __init__(self, vision_encoder: nn.Module, language_model: nn.Module, config: ModelConfig) -> None:
+    def __init__(
+        self, vision_encoder: nn.Module, language_model: nn.Module, config: ModelConfig
+    ) -> None:
         super().__init__()
         self.vision_encoder = vision_encoder
         self.language_model = language_model
@@ -85,19 +98,38 @@ class MathVLM(nn.Module):
         for p in self.language_model.parameters():
             p.requires_grad = False
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> Any:
-        """Forward pass with loss.
+    def _build_inputs_embeds(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        pixel_values = batch["pixel_values"]
+        b, t = pixel_values.shape[0], pixel_values.shape[1]
+        flat = pixel_values.flatten(0, 1)
+        vision_out = self.vision_encoder(flat)
+        if hasattr(vision_out, "last_hidden_state"):
+            vision_hidden = vision_out.last_hidden_state
+        else:
+            vision_hidden = vision_out
+        vision_hidden = vision_hidden.reshape(b, -1, vision_hidden.shape[-1])
 
-        TODO:
-            - encode images;
-            - map to visual embeddings;
-            - get text input embeddings;
-            - merge visual/text embeddings;
-            - call language_model with inputs_embeds, attention_mask, labels.
-        """
-        raise NotImplementedError("Implement MathVLM.forward")
+        visual_embeds = self.adapter(vision_hidden)
+        text_embeds = self.language_model.get_input_embeddings()(batch["input_ids"])
+        return merge_visual_embeddings(
+            text_embeds, batch["input_ids"], visual_embeds, self.config.image_token_id
+        )
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> Any:
+        """Forward pass with loss."""
+        inputs_embeds = self._build_inputs_embeds(batch)
+        return self.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=batch.get("attention_mask"),
+            labels=batch.get("labels"),
+        )
 
     @torch.no_grad()
     def generate(self, batch: dict[str, torch.Tensor], **generation_kwargs: Any) -> torch.Tensor:
         """Generate answer token ids."""
-        raise NotImplementedError("Implement MathVLM.generate")
+        inputs_embeds = self._build_inputs_embeds(batch)
+        return self.language_model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=batch.get("attention_mask"),
+            **generation_kwargs,
+        )
